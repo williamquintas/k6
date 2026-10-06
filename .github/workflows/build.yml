@@ -711,3 +711,11 @@ jobs:
           cd packaging
           docker compose pull packager
           docker compose run --rm packager
+
+  installation-smoke:
+    needs: [configure, publish-packages, publish-github]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.configure.outputs.is_latest_stable == 'true' }}
+    permissions: {}
+    uses: ./.github/workflows/installation-smoke.yml
+    with:
+      version: ${{ needs.configure.outputs.k6_version }}

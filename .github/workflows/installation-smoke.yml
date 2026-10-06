@@ -1,0 +1,207 @@
+name: Installation smoke tests
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Published stable k6 version, including the v prefix'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published stable k6 version available in the package repositories (vMAJOR.MINOR.PATCH)'
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  VERSION: ${{ inputs.version }}
+  K6_NO_USAGE_REPORT: 'true'
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:24.04
+            package_manager: apt
+          - image: debian:13
+            package_manager: apt
+          - image: fedora:44
+            package_manager: dnf
+    steps:
+      - name: Install and test the published package
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          PACKAGE_MANAGER: ${{ matrix.package_manager }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Expected version in vMAJOR.MINOR.PATCH format' >&2
+            exit 1
+          fi
+          docker run --rm --platform linux/amd64 -i \
+            --env VERSION --env PACKAGE_MANAGER --env K6_NO_USAGE_REPORT \
+            "$IMAGE" bash -s <<'SCRIPT'
+          set -euo pipefail
+          expected="${VERSION#v}"
+          if command -v k6; then
+            echo 'k6 must not be installed before the test' >&2
+            exit 1
+          fi
+
+          retry_network() {
+            local attempt
+            for attempt in {1..6}; do
+              if "$@"; then
+                return 0
+              fi
+              if (( attempt == 6 )); then
+                return 1
+              fi
+              echo "Network operation failed; retrying in 20 seconds ($attempt/6)" >&2
+              sleep 20
+            done
+          }
+
+          mkdir -p /tmp/k6-packages
+          cd /tmp/k6-packages
+          package_version=''
+          if [[ "$PACKAGE_MANAGER" == apt ]]; then
+            export DEBIAN_FRONTEND=noninteractive
+            retry_network apt-get update -o APT::Update::Error-Mode=any
+            apt-get install -y --no-install-recommends ca-certificates curl gnupg
+            retry_network curl -fsSL --connect-timeout 15 --max-time 60 \
+              https://dl.k6.io/key.gpg -o /tmp/k6-key.gpg
+            gpg --batch --yes --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg /tmp/k6-key.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main' \
+              > /etc/apt/sources.list.d/k6.list
+
+            for attempt in {1..6}; do
+              if apt-get update -o APT::Update::Error-Mode=any; then
+                package_version=$(apt-cache madison k6 | awk -v expected="$expected" '$3 == expected { print $3; exit }')
+              fi
+              if [[ -n "$package_version" ]]; then
+                break
+              fi
+              if (( attempt == 6 )); then
+                echo "Published package $VERSION is unavailable" >&2
+                exit 1
+              fi
+              sleep 20
+            done
+            retry_network apt-get download "k6=$package_version"
+            apt-get install -y --no-install-recommends ./*.deb
+          elif [[ "$PACKAGE_MANAGER" == dnf ]]; then
+            retry_network dnf makecache --refresh
+            dnf install -y ca-certificates curl-minimal
+            retry_network curl -fsSL --connect-timeout 15 --max-time 60 \
+              https://dl.k6.io/rpm/repo.rpm -o /tmp/k6-repo.rpm
+            dnf install -y /tmp/k6-repo.rpm
+            rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-k6-io
+
+            for attempt in {1..6}; do
+              if packages=$(dnf --refresh --repo=k6 repoquery --arch=x86_64 \
+                --queryformat '%{version} %{full_nevra}\n' k6); then
+                package_version=$(printf '%s\n' "$packages" | awk -v expected="$expected" '$1 == expected { print $2; exit }')
+              fi
+              if [[ -n "$package_version" ]]; then
+                break
+              fi
+              if (( attempt == 6 )); then
+                echo "Published package $VERSION is unavailable" >&2
+                exit 1
+              fi
+              sleep 20
+            done
+            retry_network dnf download --destdir /tmp/k6-packages "$package_version"
+            dnf install -y --setopt=localpkg_gpgcheck=1 ./*.rpm
+          else
+            echo 'Unsupported package manager' >&2
+            exit 1
+          fi
+
+          installed_version=$(k6 version | awk '{ print $2 }')
+          if [[ "$installed_version" != "$VERSION" ]]; then
+            echo "Expected $VERSION, installed $installed_version" >&2
+            exit 1
+          fi
+          k6 --help
+          cat > /tmp/k6-smoke.js <<'JS'
+          export default function () {
+            if (__VU !== 1 || __ITER !== 0) {
+              throw new Error('Expected one VU and one iteration');
+            }
+          }
+          JS
+          k6 run --vus 1 --iterations 1 /tmp/k6-smoke.js
+          SCRIPT
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate the version
+        run: |
+          if ($env:VERSION -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+\z') {
+            throw 'Expected version in vMAJOR.MINOR.PATCH format'
+          }
+          $binary = Join-Path $env:ProgramFiles 'k6\k6.exe'
+          if (Test-Path $binary) {
+            throw 'k6 must not be installed before the test'
+          }
+      - name: Install the published MSI
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "k6-$env:VERSION.msi"
+          $url = "https://github.com/grafana/k6/releases/download/$env:VERSION/k6-$env:VERSION-windows-amd64.msi"
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 60 -ErrorAction Stop
+              break
+            } catch {
+              if ($attempt -eq 6) { throw }
+              Write-Warning "Download failed; retrying in 20 seconds ($attempt/6)"
+              Start-Sleep -Seconds 20
+            }
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'k6-msi.log'
+          $arguments = "/i `"$msi`" /qn /norestart /l*v `"$log`""
+          $installer = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($installer.ExitCode -notin 0, 3010) {
+            Get-Content $log -Tail 40
+            throw "MSI installation failed with exit code $($installer.ExitCode)"
+          }
+          if ($installer.ExitCode -eq 3010) {
+            Write-Output '::notice::MSI requested a reboot; checking the installed executable before accepting the installation'
+          }
+      - name: Test the installed executable
+        run: |
+          $binary = Join-Path $env:ProgramFiles 'k6\k6.exe'
+          if (!(Test-Path $binary)) { throw 'Installed k6 executable was not found' }
+          $versionOutput = & $binary version
+          if ($LASTEXITCODE -ne 0) { throw 'k6 version failed' }
+          if ($versionOutput -notmatch '^k6 (v[0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)' -or $Matches[1] -cne $env:VERSION) {
+            throw "Expected $env:VERSION, installed $versionOutput"
+          }
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw 'k6 help failed' }
+          $script = Join-Path $env:RUNNER_TEMP 'k6-smoke.js'
+          @'
+          export default function () {
+            if (__VU !== 1 || __ITER !== 0) {
+              throw new Error('Expected one VU and one iteration');
+            }
+          }
+          '@ | Set-Content -Path $script -Encoding utf8
+          & $binary run --vus 1 --iterations 1 $script
+          if ($LASTEXITCODE -ne 0) { throw 'k6 local smoke test failed' }
